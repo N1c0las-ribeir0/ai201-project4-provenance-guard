@@ -19,17 +19,20 @@ def _append(entry):
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def log_decision(submission_id, timestamp, decision, llm_result,
+def log_decision(content_id, timestamp, decision, llm_result,
                  stylometry_result, creator_id):
     """Record an attribution decision."""
     _append({
         "event": "decision",
-        "submission_id": submission_id,
-        "timestamp": timestamp,
+        "content_id": content_id,
         "creator_id": creator_id,
-        "verdict": decision["verdict"],
+        "timestamp": timestamp,
+        "attribution": decision["verdict"],
         "confidence": decision["confidence"],
         "p_ai": decision["p_ai"],
+        "llm_score": llm_result["p_ai"],
+        "stylometry_score": stylometry_result["p_ai"],
+        "status": "classified",
         "signals": {
             "llm": {"p_ai": llm_result["p_ai"], "rationale": llm_result.get("rationale", "")},
             "stylometry": {"p_ai": stylometry_result["p_ai"],
@@ -38,16 +41,17 @@ def log_decision(submission_id, timestamp, decision, llm_result,
     })
 
 
-def log_appeal(appeal_id, submission_id, timestamp, reason, original_decision):
+def log_appeal(appeal_id, content_id, timestamp, appeal_reasoning, original_decision):
     """Record an appeal alongside a snapshot of the original decision."""
     _append({
         "event": "appeal",
         "appeal_id": appeal_id,
-        "submission_id": submission_id,
+        "content_id": content_id,
         "timestamp": timestamp,
-        "reason": reason,
+        "status": "under_review",
+        "appeal_reasoning": appeal_reasoning,
         "original_decision": {
-            "verdict": original_decision.get("verdict"),
+            "attribution": original_decision.get("attribution"),
             "confidence": original_decision.get("confidence"),
             "p_ai": original_decision.get("p_ai"),
         },

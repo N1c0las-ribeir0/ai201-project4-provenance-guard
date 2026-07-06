@@ -24,19 +24,28 @@ AUDIT_LOG_PATH = DATA_DIR / "audit_log.jsonl"
 # --- Scoring -----------------------------------------------------------------
 # The LLM read is weighted higher than the structural heuristics because it
 # captures meaning the stylometry is blind to; stylometry is the sanity check.
-LLM_WEIGHT = 0.65
-STYLOMETRY_WEIGHT = 0.35
+LLM_WEIGHT = 0.70
+STYLOMETRY_WEIGHT = 0.30
 
-# Decision thresholds on the combined P(AI). Declaring AI needs a much higher
-# bar than declaring human: a false positive (accusing a human) is the costly
-# error on a creative platform, so the "AI" zone is deliberately narrow.
-AI_THRESHOLD = 0.80        # p_ai >= this AND signals agree -> high-confidence AI
-HUMAN_THRESHOLD = 0.25     # p_ai <= this -> high-confidence human
-# Everything between is reported as "uncertain".
+# Within the stylometry signal, burstiness (sentence-length variability) is the
+# most reliable human/AI discriminator; type-token ratio is the noisiest (it is
+# length-dependent and, on short texts, formal AI prose can be MORE diverse than
+# casual human writing). Weight the features accordingly.
+STYLOMETRY_FEATURE_WEIGHTS = {
+    "burstiness": 0.5,
+    "punctuation": 0.3,
+    "ttr": 0.2,
+}
 
-# When the two signals land on opposite sides of 0.5 they disagree; we pull the
-# combined score toward the fence and cap confidence so conflict reads as doubt.
-DISAGREEMENT_CONFIDENCE_CAP = 0.4
+# Decision thresholds on the combined P(AI): >=0.65 -> AI, <=0.35 -> human, the
+# band between -> uncertain. The false-positive aversion (never lightly accuse a
+# human) is carried behaviourally, not by the raw numbers: the LLM prompt is told
+# to lean human when torn, and the disagreement damping below almost always fires
+# on the "LLM says AI / stylometry says human" pattern that formal-but-human prose
+# produces, dragging borderline AI calls back toward "uncertain".
+AI_THRESHOLD = 0.65        # p_ai >= this -> likely AI
+HUMAN_THRESHOLD = 0.35     # p_ai <= this -> likely human
+# Everything between (0.35, 0.65) is reported as "uncertain".
 
 # --- Input limits ------------------------------------------------------------
 MAX_CONTENT_CHARS = 20_000   # generous for a poem/story excerpt/blog post

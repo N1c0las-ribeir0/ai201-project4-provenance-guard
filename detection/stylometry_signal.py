@@ -10,8 +10,10 @@ and AI writing, independent of meaning:
   * Punctuation density — humans pepper in dashes, semicolons, parentheses and
     varied marks; AI tends toward plainer, comma-and-period prose.
 
-Each feature is normalised to a 0..1 "AI-likeness" score and averaged into the
-signal's p_ai.
+Each feature is normalised to a 0..1 "AI-likeness" score and combined into the
+signal's p_ai as a weighted sum (see config.STYLOMETRY_FEATURE_WEIGHTS). Burstiness
+carries the most weight because it separates human/AI most reliably; TTR the least
+(it is length-dependent and directionally weak on short texts).
 
 Blind spot: short texts are noisy (few sentences -> unstable variance), and a
 formulaic human or a deliberately varied AI can invert the pattern. This is why
@@ -19,6 +21,8 @@ it is only one of two signals and never decides alone.
 """
 import re
 import statistics
+
+import config
 
 # Below this many sentences the structural stats are too noisy to trust, so we
 # hedge the signal back toward 0.5 (see p_ai computation).
@@ -78,7 +82,10 @@ def analyze(text):
     # Rich, varied punctuation reads human; sparse reads AI-uniform.
     punct_ai = _clamp((0.12 - punct_density) / 0.12)  # >=0.12/word -> human
 
-    raw_p_ai = statistics.mean([burstiness_ai, ttr_ai, punct_ai])
+    w = config.STYLOMETRY_FEATURE_WEIGHTS
+    raw_p_ai = (w["burstiness"] * burstiness_ai
+                + w["punctuation"] * punct_ai
+                + w["ttr"] * ttr_ai)
 
     # Reliability hedge: with too few sentences, blend the estimate back toward
     # 0.5 rather than pretending to certainty.

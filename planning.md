@@ -32,12 +32,12 @@ SUBMISSION FLOW
                              ├── audit entry ──▶ audit_log.jsonl │
                              ├── record ──▶ store (submissions.json)
                              ▼                                   │
-  client ◀──── JSON: {id, verdict, confidence, label, signals} ◀┘
+  client ◀── JSON: {content_id, attribution, confidence, label, signals} ◀┘
 
 APPEAL FLOW
-  client ──POST /appeal──▶ app.py ──▶ store: status = "under review"
-   {submission_id,               └──▶ audit_log.jsonl (appeal + orig decision)
-    reason}          ◀── JSON: {appeal_id, status:"under review"} ──┘
+  client ──POST /appeal──▶ app.py ──▶ store: status = "under_review"
+   {content_id,               └──▶ audit_log.jsonl (appeal + orig decision)
+    creator_reasoning}  ◀── JSON: {appeal_id, status:"under_review"} ──┘
 ```
 
 ### Narrative — the path one text takes
@@ -49,10 +49,9 @@ APPEAL FLOW
      is AI-written plus a one-line rationale.
    - **`stylometry_signal`** (pure Python) computes structural features and returns
      its own AI-probability.
-3. **`scoring.combine`** merges the two into a single `p_ai` and a `confidence`,
-   applying an *agreement check* (disagreeing signals lower confidence) and
-   *false-positive-aware thresholds* (calling something AI takes a higher bar than
-   calling it human).
+3. **`scoring.combine`** merges the two (weighted 0.70 LLM / 0.30 stylometry) into a
+   single `p_ai` and a `confidence`, damping toward 0.5 when the signals disagree so
+   conflict reads as "uncertain" rather than a confident-but-fragile verdict.
 4. **`labels.build_label`** maps the verdict + confidence to one of **three**
    plain-language transparency labels.
 5. The full decision (verdict, confidence, both signal scores, timestamp) is appended
@@ -60,8 +59,8 @@ APPEAL FLOW
    (`store.py` → `submissions.json`).
 6. A structured JSON response goes back to the client.
 
-**Appeal flow:** `POST /appeal` takes a `submission_id` + the creator's reasoning →
-the stored submission's status flips to `"under review"` → the appeal (reason + a
+**Appeal flow:** `POST /appeal` takes a `content_id` + the creator's reasoning →
+the stored submission's status flips to `"under_review"` → the appeal (reasoning + a
 snapshot of the original decision) is appended to the audit log → a confirmation
 with the appeal id and new status is returned. No automated re-classification — a
 human reviews contested content.
@@ -109,7 +108,11 @@ Structural properties that are independent of meaning:
 - **Punctuation density:** humans use varied marks (dashes, semicolons, parentheses);
   AI trends toward plainer comma-and-period prose.
 
-Each feature is normalised to a 0–1 "AI-likeness" and averaged into the signal's `p_ai`.
+Each feature is normalised to a 0–1 "AI-likeness" and combined as a **weighted sum**
+(burstiness 0.5, punctuation 0.3, type-token ratio 0.2). Burstiness carries the most
+weight because it separates human/AI most reliably; TTR the least — it is length-dependent
+and, on short texts, formal AI prose can be *more* lexically diverse than casual human
+writing, so it is directionally weak.
 
 - **Why it differs:** these are statistical fingerprints the LLM's semantic read can
   miss — a structural cross-check.
@@ -124,29 +127,66 @@ Each feature is normalised to a 0–1 "AI-likeness" and averaged into the signal
 We decided what the numbers should **mean** before choosing the math.
 
 - `p_ai` — combined probability the text is AI (0–1).
-- `confidence` — how sure we are of the verdict. **0.5-ish `p_ai` → ~0 confidence;
-  the extremes → ~1.** This is the number shown to users.
+- `confidence` — the probability mass behind the verdict we report, i.e.
+  `max(p_ai, 1 − p_ai)`. It ranges **0.5 (a coin toss) → 1.0 (certain)** and reads
+  naturally: "Likely AI, confidence 71%" means `p_ai = 0.71`.
 
-**Combine:** `p_ai = 0.65 · llm_p_ai + 0.35 · stylometry_p_ai`. The LLM read is
-weighted higher because it captures meaning the stylometry is blind to; stylometry is
-the sanity check.
+**What a `confidence` of 0.6 means here:** the system leans one way but only modestly —
+`p_ai` sits around 0.40 or 0.60, inside the **uncertain** band `(0.35, 0.65)`. So a 0.6
+confidence text is reported as *uncertain* and shows the uncertain label — "our best
+guess, but we wouldn't stake a verdict on it." A 0.95 confidence means both signals
+strongly and agreeingly point the same way.
 
-**Agreement adjustment:** if the two signals land on opposite sides of 0.5 they
-disagree — we pull `p_ai` halfway back toward 0.5 and cap `confidence`, so conflict
-surfaces as doubt rather than a confident-but-fragile verdict.
+**Mapping raw signal outputs → calibrated score:** each signal emits a 0–1 `p_ai`; we do
+*not* trust either alone. We (1) take a weighted sum (**0.70 LLM / 0.30 stylometry**),
+(2) damp it gently toward 0.5 when the signals disagree, and (3) set `confidence` to the
+probability of the leaning class. Disagreement or a weak signal naturally collapses the
+result toward the "uncertain" band rather than a spuriously precise verdict.
 
-**Verdict thresholds (false-positive asymmetry):**
+**Combine:** `p_ai = 0.70 · llm_p_ai + 0.30 · stylometry_p_ai`. The LLM read is weighted
+higher because it captures meaning the stylometry is blind to; stylometry is the
+structural sanity check.
+
+**Disagreement damping:** if the two signals land on opposite sides of 0.5 they disagree
+— we pull `p_ai` gently back toward 0.5 (`0.5 + (p_ai − 0.5)·0.85`). In practice this
+fires on the "LLM says AI / stylometry says human" pattern that formal-but-human prose
+produces, so it holds back borderline AI calls — the false-positive-averse direction.
+
+**Verdict thresholds:**
 
 | Condition | Verdict | Label variant |
 |-----------|---------|---------------|
-| `p_ai ≥ 0.80` **and** signals agree | `likely_ai` | high-confidence AI |
-| `p_ai ≤ 0.25` | `likely_human` | high-confidence human |
-| otherwise (incl. a 0.51) | `uncertain` | uncertain |
+| `p_ai ≥ 0.65` | `likely_ai` | high-confidence AI |
+| `p_ai ≤ 0.35` | `likely_human` | high-confidence human |
+| otherwise (e.g. a 0.55) | `uncertain` | uncertain |
 
-The "AI" zone is deliberately narrow: declaring AI needs strong, *agreeing* evidence,
-while the default for anything ambiguous is `uncertain` — never a stray accusation.
+**Where the false-positive aversion lives:** not in the raw thresholds (which are
+symmetric) but in behaviour — the LLM prompt is explicitly told to lean human when torn
+and not to flag dense human prose as AI merely for being formal, and the disagreement
+damping mostly suppresses AI calls. `uncertain` is the default for anything ambiguous —
+never a stray accusation.
 
 ---
+
+## Transparency labels — exact text
+
+Three variants, keyed by verdict. `{NN}` is the confidence as a whole percentage. This
+is the canonical wording, implemented verbatim in `detection/labels.py` and reproduced
+in the README.
+
+| Variant | Trigger | Exact label text |
+|---------|---------|------------------|
+| **High-confidence AI** | verdict `likely_ai` | `⚠️ Likely AI-generated. Our analysis strongly suggests this text was produced by an AI system. Confidence: {NN}%. The creator can appeal this assessment.` |
+| **High-confidence human** | verdict `likely_human` | `✍️ Likely human-written. Our analysis found no strong signs of AI generation. Confidence: {NN}%.` |
+| **Uncertain** | verdict `uncertain` | `❓ Uncertain origin. Our analysis couldn't reliably determine whether this text is human- or AI-written, so we're not making a call. Treat attribution as unconfirmed.` |
+
+**Design review of the wording:**
+- The AI label says "**suggests**" and offers the appeal path in the same breath — it
+  never states AI authorship as fact, softening the worst error (accusing a human).
+- Only the two confident labels show a percentage; the uncertain label deliberately
+  omits a number, because surfacing "51%" would imply false precision to a lay reader.
+- Each label leads with an emoji + a short verdict phrase so it's scannable, then one
+  sentence of context — readable by a non-technical audience.
 
 ## The false-positive scenario (traced through the system)
 
@@ -154,14 +194,13 @@ A human poet submits a spare, tightly-controlled poem. Its short, uniform lines 
 the **stylometry** signal read AI-like (low burstiness, modest TTR). But:
 
 1. The **LLM** signal reads it as human (`p_ai ≈ 0.2`), so the two signals **disagree**.
-2. `scoring.combine` detects the disagreement, pulls the combined `p_ai` toward 0.5,
-   and caps confidence.
-3. The combined `p_ai` never clears the 0.80 AI bar, so the verdict is **`uncertain`**,
-   not `likely_ai`.
+2. `scoring.combine` detects the disagreement and damps the combined `p_ai` toward 0.5.
+3. The combined `p_ai` never clears the 0.65 AI threshold, so the verdict is
+   **`uncertain`**, not `likely_ai`.
 4. The reader sees the **uncertain** label ("we're not making a call"), not an
    accusation.
 5. If the creator still disputes it, **`POST /appeal`** logs their reasoning, flips the
-   status to `under review`, and records the appeal beside the original decision in the
+   status to `under_review`, and records the appeal beside the original decision in the
    audit log for a human to examine.
 
 The disagreement mechanism plus the narrow AI zone plus the appeal path are three
@@ -169,12 +208,38 @@ independent guards against the costly error.
 
 ---
 
+## Appeals workflow
+
+- **Who can appeal:** the creator of a classified submission (in this backend, anyone
+  holding the `content_id` — a real platform would gate this behind the authenticated
+  author of that content). Appeals are meant for creators who believe they've been
+  misclassified, most importantly a human wrongly flagged as AI.
+- **What they provide:** the `content_id` and a free-text `creator_reasoning` explaining
+  why they contest the classification. Both are required; empty reasoning is rejected (400).
+- **What the system does on receipt:**
+  1. Verifies the submission exists (404 if not).
+  2. Flips the submission's `status` from `classified` → **`under_review`**.
+  3. Writes an **appeal record** (`store` → `appeals.json`) with a snapshot of the
+     original verdict and confidence.
+  4. Appends an **`appeal` entry** to the audit log, beside the original decision.
+  5. Returns `{ appeal_id, content_id, status: "under_review", message }`.
+- **No automated re-classification** — a contested item waits for a human.
+- **What a human reviewer sees when they open the appeal queue:** by reading `GET /log`
+  (or `appeals.json`), the reviewer sees, per appeal — the creator's stated reason, the
+  original verdict + confidence + `p_ai`, both signal scores (the LLM's rationale and the
+  stylometry features), and the timestamps. That is enough to judge whether the original
+  call was sound without re-running detection. (A production build would render this as a
+  queue UI; here it is the structured log.)
+
 ## API surface (the contract)
 
 | Endpoint | Request | Response | Notes |
 |----------|---------|----------|-------|
-| `POST /submit` | `{ "content": str, "creator_id"?: str }` | `{ submission_id, verdict, confidence, p_ai, label:{variant,text}, signals:{llm,stylometry}, status }` | Rate-limited; 400 on empty/oversized content |
-| `POST /appeal` | `{ "submission_id": str, "reason": str }` | `{ appeal_id, submission_id, status:"under review", message }` | 404 unknown id, 400 empty reason |
+| `POST /submit` | `{ "text": str, "creator_id"?: str }` | `{ content_id, attribution, confidence, p_ai, label:{variant,text}, signals:{llm,stylometry}, status }` | Rate-limited; 400 on empty/oversized text |
+| `POST /appeal` | `{ "content_id": str, "creator_reasoning": str }` | `{ appeal_id, content_id, status:"under_review", message }` | 404 unknown id, 400 empty reasoning |
+
+> **Naming note:** the public API uses `attribution` for the verdict field; internally
+> the `scoring` module still calls it `verdict`. `attribution` ∈ `{likely_ai, likely_human, uncertain}`.
 | `GET /log` | — | `[ audit entries… ]` (oldest first) | Structured audit log |
 | `GET /health` | — | `{ "status": "ok" }` | Liveness |
 
@@ -198,12 +263,76 @@ Flask-Limiter, per client IP:
 
 Append-only JSONL, one object per event.
 
-- **decision:** `{ event, submission_id, timestamp, creator_id, verdict, confidence, p_ai, signals:{llm, stylometry} }`
-- **appeal:** `{ event, appeal_id, submission_id, timestamp, reason, original_decision:{verdict, confidence, p_ai} }`
+- **decision:** `{ event, content_id, creator_id, timestamp, attribution, confidence, p_ai, llm_score, stylometry_score, status:"classified", signals:{llm, stylometry} }`
+- **appeal:** `{ event, appeal_id, content_id, timestamp, status:"under_review", appeal_reasoning, original_decision:{attribution, confidence, p_ai} }`
 
 Surfaced via `GET /log`.
 
 ---
+
+## Anticipated edge cases
+
+Specific content types this system will handle poorly, and how the design tries to fail
+*safely* (toward "uncertain") rather than toward a false accusation:
+
+1. **A minimalist poem with heavy repetition and simple vocabulary.** Short lines and a
+   deliberately small word set drive the stylometry signal AI-ward (low burstiness, low
+   type-token ratio, sparse punctuation) even though a human wrote it. Mitigations: the
+   sub-4-sentence reliability hedge pulls the stylometry score toward 0.5, the LLM signal
+   usually still reads the voice as human (creating a disagreement that damps `p_ai`), and
+   the narrow AI threshold means the likely outcome is the **uncertain** label, not a
+   false "AI" flag.
+
+2. **A dense, formulaic corporate/academic paragraph written by a human.** Uniform
+   sentence rhythm, safe vocabulary, and plain punctuation make *genuine* human business
+   writing look statistically AI-like, and the LLM may agree it "reads generated." Here
+   both signals can push high together — this is the case most likely to misfire. The
+   design accepts this residual risk but bounds its cost: the label hedges with
+   "suggests," offers the appeal in-line, and the appeal path lets the writer contest it.
+
+3. **Very short input (a single sentence or a tweet-length fragment).** Neither signal has
+   enough to work with — stylometry variance is undefined and the LLM has little to judge.
+   The stylometry hedge and the LLM's instruction to "stay near 0.5 when unsure" both push
+   this to **uncertain** by design.
+
+4. **AI text lightly edited by a human (hybrid authorship).** The most fundamental blind
+   spot — editing smooths away exactly the fingerprints both signals rely on. The system
+   will often call this "uncertain" or even "human"; this is an acknowledged limit of the
+   state of the art, and the honest label ("we're not making a call") is the correct
+   response rather than false confidence.
+
+## AI Tool Plan
+
+How each implementation milestone uses this spec as the prompt for AI-assisted codegen.
+
+**M3 — submission endpoint + first signal**
+- *Spec sections provided:* `## Architecture` (diagram + narrative), Detection signals
+  (Signal 1), API surface (`POST /submit`).
+- *Ask the tool to generate:* the Flask app skeleton (`app.py` with `/submit` + `/health`),
+  `config.py`, and the `llm_signal.analyze(text)` function returning `{p_ai, rationale, ok}`.
+- *Verify:* call `llm_signal.analyze` directly on 2–3 texts (obvious AI, obvious human)
+  and eyeball the probabilities *before* wiring it into the endpoint; confirm the strict-
+  JSON parse and the `p_ai=0.5` fallback both work when the reply is malformed / the key
+  is missing.
+
+**M4 — second signal + confidence scoring**
+- *Spec sections provided:* Detection signals (Signal 2), Confidence scoring +
+  uncertainty representation, the diagram.
+- *Ask the tool to generate:* `stylometry_signal.analyze(text)` (burstiness, TTR,
+  punctuation density → `{p_ai, features}`) and `scoring.combine(llm, stylometry)` with
+  the weighting, disagreement damping, and thresholds.
+- *Verify:* run clearly-AI vs clearly-human samples through the combined scorer and
+  confirm the scores **separate meaningfully** (AI text lands high, human low, ambiguous
+  near 0.5); confirm a synthetic disagreement caps confidence and yields `uncertain`.
+
+**M5 — production layer (labels, appeals, rate limit, audit)**
+- *Spec sections provided:* Transparency labels (exact text), Appeals workflow, Rate
+  limiting, Audit log, the diagram.
+- *Ask the tool to generate:* `labels.build_label(decision)`, the `POST /appeal` endpoint,
+  Flask-Limiter wiring, and `audit.py` / `store.py`.
+- *Verify:* craft inputs that reach **all three** label variants; confirm an appeal flips
+  status to `under_review` and writes both an appeal record and an audit entry; confirm
+  `GET /log` shows ≥3 structured entries; confirm >10 `/submit` calls in a minute return 429.
 
 ## Decisions log
 

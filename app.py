@@ -1,9 +1,9 @@
 """Provenance Guard — Flask API.
 
 Endpoints:
-  POST /submit  — classify a piece of text, return verdict + confidence + label
+  POST /submit  — classify a piece of text, return attribution + confidence + label
   POST /appeal  — contest a classification; flips status to "under review"
-  GET  /log     — the structured audit log
+  GET  /log     — the structured audit log ({"entries": [...]}, newest first)
   GET  /health  — liveness check
 """
 import uuid
@@ -24,6 +24,7 @@ limiter = Limiter(
     key_func=get_remote_address,
     app=app,
     default_limits=[],  # only the endpoints we explicitly decorate are limited
+    storage_uri="memory://",  # in-memory store is fine for local dev
 )
 
 
@@ -44,33 +45,33 @@ def health():
 @limiter.limit(config.SUBMIT_RATE_LIMITS)
 def submit():
     body = request.get_json(silent=True) or {}
-    content = body.get("content")
+    text = body.get("text")
     creator_id = body.get("creator_id")
 
-    if not isinstance(content, str) or not content.strip():
-        return _error("Field 'content' is required and must be non-empty text.", 400)
-    if len(content) > config.MAX_CONTENT_CHARS:
+    if not isinstance(text, str) or not text.strip():
+        return _error("Field 'text' is required and must be non-empty text.", 400)
+    if len(text) > config.MAX_CONTENT_CHARS:
         return _error(
-            f"Content exceeds the {config.MAX_CONTENT_CHARS}-character limit.", 400
+            f"Text exceeds the {config.MAX_CONTENT_CHARS}-character limit.", 400
         )
 
     # --- run the two signals ------------------------------------------------
-    llm_result = llm_signal.analyze(content)
-    sty_result = stylometry_signal.analyze(content)
+    llm_result = llm_signal.analyze(text)
+    sty_result = stylometry_signal.analyze(text)
 
     # --- combine + label ----------------------------------------------------
     decision = scoring.combine(llm_result, sty_result)
     label = labels.build_label(decision)
 
-    submission_id = f"sub_{uuid.uuid4().hex[:12]}"
+    content_id = f"sub_{uuid.uuid4().hex[:12]}"
     timestamp = _now()
 
     record = {
-        "submission_id": submission_id,
+        "content_id": content_id,
         "timestamp": timestamp,
         "creator_id": creator_id,
-        "content": content,
-        "verdict": decision["verdict"],
+        "text": text,
+        "attribution": decision["verdict"],
         "confidence": decision["confidence"],
         "p_ai": decision["p_ai"],
         "label": label,
@@ -78,12 +79,12 @@ def submit():
         "status": "classified",
     }
     store.save_submission(record)
-    audit.log_decision(submission_id, timestamp, decision, llm_result,
+    audit.log_decision(content_id, timestamp, decision, llm_result,
                        sty_result, creator_id)
 
     return jsonify({
-        "submission_id": submission_id,
-        "verdict": decision["verdict"],
+        "content_id": content_id,
+        "attribution": decision["verdict"],
         "confidence": decision["confidence"],
         "p_ai": decision["p_ai"],
         "label": label,
@@ -101,35 +102,35 @@ def submit():
 @limiter.limit(config.APPEAL_RATE_LIMITS)
 def appeal():
     body = request.get_json(silent=True) or {}
-    submission_id = body.get("submission_id")
-    reason = body.get("reason")
+    content_id = body.get("content_id")
+    creator_reasoning = body.get("creator_reasoning")
 
-    if not isinstance(submission_id, str) or not submission_id:
-        return _error("Field 'submission_id' is required.", 400)
-    if not isinstance(reason, str) or not reason.strip():
-        return _error("Field 'reason' is required and must be non-empty.", 400)
+    if not isinstance(content_id, str) or not content_id:
+        return _error("Field 'content_id' is required.", 400)
+    if not isinstance(creator_reasoning, str) or not creator_reasoning.strip():
+        return _error("Field 'creator_reasoning' is required and must be non-empty.", 400)
 
-    original = store.get_submission(submission_id)
+    original = store.get_submission(content_id)
     if original is None:
-        return _error("No submission found with that id.", 404)
+        return _error("No submission found with that content_id.", 404)
 
-    updated = store.update_submission_status(submission_id, "under review")
+    updated = store.update_submission_status(content_id, "under_review")
 
     appeal_id = f"apl_{uuid.uuid4().hex[:12]}"
     timestamp = _now()
     store.save_appeal({
         "appeal_id": appeal_id,
-        "submission_id": submission_id,
+        "content_id": content_id,
         "timestamp": timestamp,
-        "reason": reason,
-        "original_verdict": original.get("verdict"),
+        "creator_reasoning": creator_reasoning,
+        "original_attribution": original.get("attribution"),
         "original_confidence": original.get("confidence"),
     })
-    audit.log_appeal(appeal_id, submission_id, timestamp, reason, original)
+    audit.log_appeal(appeal_id, content_id, timestamp, creator_reasoning, original)
 
     return jsonify({
         "appeal_id": appeal_id,
-        "submission_id": submission_id,
+        "content_id": content_id,
         "status": updated["status"],
         "message": "Your appeal has been logged. This content is now under review.",
     })
@@ -137,7 +138,8 @@ def appeal():
 
 @app.get("/log")
 def get_log():
-    return jsonify(audit.read_all())
+    # Newest first so the most recent decisions/appeals surface at the top.
+    return jsonify({"entries": list(reversed(audit.read_all()))})
 
 
 @app.errorhandler(429)

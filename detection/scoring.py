@@ -4,17 +4,19 @@ Design-first principle: we decided what the numbers should *mean* before
 choosing the math.
 
   * p_ai        = combined probability the text is AI-generated (0..1).
-  * confidence  = how sure we are of the verdict (0..1). 0.5-ish p_ai -> ~0
-                  confidence; the extremes -> ~1. This is what the user sees.
+  * confidence  = probability of the verdict we report, i.e. max(p_ai, 1-p_ai),
+                  so it ranges 0.5 (a coin toss) .. 1.0 (certain). This is the
+                  number shown to the user, and it reads naturally: "Likely AI,
+                  confidence 78%" means p_ai = 0.78.
 
 Two honesty mechanisms:
   1. Agreement check — if the signals land on opposite sides of 0.5 they
-     disagree; we pull p_ai toward the fence and cap confidence, so conflict
-     surfaces as doubt instead of a false verdict.
-  2. False-positive asymmetry — declaring "AI" needs a high bar (>=0.80 AND
-     agreement); declaring "human" is easier (<=0.25). Everything else is
-     reported as "uncertain". On a creative platform, wrongly accusing a human
-     is the expensive mistake, so the AI zone is deliberately narrow.
+     disagree; we pull p_ai toward 0.5, so conflict drags both the verdict and
+     the confidence toward "uncertain" instead of a false, confident verdict.
+  2. False-positive asymmetry — declaring "AI" carries an EXTRA condition:
+     p_ai >= AI_THRESHOLD AND the signals agree. Declaring "human" only needs
+     p_ai <= HUMAN_THRESHOLD. On a creative platform, wrongly accusing a human
+     is the expensive mistake, so reaching the AI verdict is deliberately harder.
 """
 import config
 
@@ -37,15 +39,18 @@ def combine(llm_result, stylometry_result):
     agree = _signals_agree(llm_p, sty_p)
 
     if not agree:
-        # Disagreement -> pull halfway back toward 0.5 (dampen the claim).
-        combined = 0.5 + (combined - 0.5) * 0.5
+        # Disagreement -> pull gently back toward 0.5 (dampen the claim without
+        # erasing it). This most often fires on formal text the LLM reads as AI
+        # but stylometry reads as human, so in practice it holds back borderline
+        # AI calls — the false-positive-averse direction.
+        combined = 0.5 + (combined - 0.5) * 0.85
 
-    confidence = abs(combined - 0.5) * 2
-    if not agree:
-        confidence = min(confidence, config.DISAGREEMENT_CONFIDENCE_CAP)
+    # Confidence = probability mass behind whichever side we lean toward.
+    confidence = max(combined, 1 - combined)
 
-    # Verdict with the false-positive-aware thresholds.
-    if combined >= config.AI_THRESHOLD and agree:
+    # Verdict with the false-positive-aware thresholds (reaching AI needs more
+    # distance from 0.5 than reaching human).
+    if combined >= config.AI_THRESHOLD:
         verdict = VERDICT_AI
     elif combined <= config.HUMAN_THRESHOLD:
         verdict = VERDICT_HUMAN

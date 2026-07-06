@@ -35,20 +35,20 @@ def _write(path, data):
 def save_submission(record):
     with _lock:
         data = _read(config.SUBMISSIONS_PATH)
-        data[record["submission_id"]] = record
+        data[record["content_id"]] = record
         _write(config.SUBMISSIONS_PATH, data)
 
 
-def get_submission(submission_id):
+def get_submission(content_id):
     with _lock:
-        return _read(config.SUBMISSIONS_PATH).get(submission_id)
+        return _read(config.SUBMISSIONS_PATH).get(content_id)
 
 
-def update_submission_status(submission_id, status):
+def update_submission_status(content_id, status):
     """Set a submission's status. Returns the updated record or None if absent."""
     with _lock:
         data = _read(config.SUBMISSIONS_PATH)
-        record = data.get(submission_id)
+        record = data.get(content_id)
         if record is None:
             return None
         record["status"] = status
