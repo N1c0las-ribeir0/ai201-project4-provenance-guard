@@ -14,3 +14,7 @@ env/
 
 # macOS
 .DS_Store
+
+
+# Runtime data stores
+data/
